@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Databases and backups
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+
+# Packet captures
+*.pcap
+*.pcapng
+*.cap
+
+# Certificates
+*.cer
+*.crt
+
+# Generated files
+reports/*
+!reports/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
