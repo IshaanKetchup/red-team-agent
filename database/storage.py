@@ -326,6 +326,7 @@ def initialize_services_table():
         """)
 
 
+
 def initialize_findings_table():
     with _connection() as conn:
         conn.execute("""
@@ -338,7 +339,36 @@ def initialize_findings_table():
             )
         """)
 
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(scan_runs)")
+        }
+
+        if "snapshot_recorded" not in columns:
+            conn.execute("""
+                ALTER TABLE scan_runs
+                ADD COLUMN snapshot_recorded INTEGER NOT NULL DEFAULT 0
+            """)
+
         _migrate_findings_table(conn)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scan_run_findings (
+                run_id INTEGER NOT NULL,
+                finding_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                host TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                first_seen TIMESTAMP,
+                last_seen TIMESTAMP,
+                status TEXT NOT NULL,
+                resolved_at TIMESTAMP,
+                finding_key TEXT NOT NULL,
+                PRIMARY KEY (run_id, finding_id)
+            )
+        """)
+
 
 
 def start_scan_run():
@@ -547,15 +577,27 @@ def save_findings(findings: list[dict], run_id: int, conn=None):
             ))
 
 
+
 def complete_scan_run(
     run_id: int,
     checked_hosts: list[str],
     ldap_checked: bool,
     conn=None,
 ):
-    """Resolve findings and complete the scan in the supplied transaction."""
+    """Resolve findings, snapshot the final state, and complete the scan."""
 
     with _connection(conn) as connection:
+        run = connection.execute("""
+            SELECT status
+            FROM scan_runs
+            WHERE id = ?
+        """, (run_id,)).fetchone()
+
+        if run is None or run[0] != "RUNNING":
+            raise RuntimeError(
+                f"Scan run {run_id} does not exist or is not RUNNING."
+            )
+
         if checked_hosts:
             placeholders = ",".join("?" for _ in checked_hosts)
 
@@ -584,10 +626,24 @@ def complete_scan_run(
                   AND host = ?
             """, (run_id, DOMAIN_LABEL))
 
+        connection.execute("""
+            INSERT INTO scan_run_findings (
+                run_id, finding_id, rule_id, severity,
+                host, evidence, first_seen, last_seen,
+                status, resolved_at, finding_key
+            )
+            SELECT
+                ?, id, rule_id, severity,
+                host, evidence, first_seen, last_seen,
+                status, resolved_at, finding_key
+            FROM findings
+        """, (run_id,))
+
         cursor = connection.execute("""
             UPDATE scan_runs
             SET status = 'COMPLETED',
                 completed_at = CURRENT_TIMESTAMP,
+                snapshot_recorded = 1,
                 error = NULL
             WHERE id = ?
               AND status = 'RUNNING'
@@ -595,8 +651,9 @@ def complete_scan_run(
 
         if cursor.rowcount != 1:
             raise RuntimeError(
-                f"Scan run {run_id} does not exist or is not RUNNING."
+                f"Scan run {run_id} could not be completed."
             )
+
 
 
 def abort_scan_run(run_id: int, reason: str = "Scan incomplete"):
@@ -637,3 +694,492 @@ def get_scan_runs(limit: int = 20):
             ORDER BY id DESC
             LIMIT ?
         """, (limit,)).fetchall()
+
+
+def _bounded_read_limit(limit, default=50, maximum=200):
+    """Validate and cap limits for read-only inventory queries."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = default
+
+    return max(1, min(limit, maximum))
+
+
+def _rows_as_dicts(cursor):
+    columns = [column[0] for column in cursor.description]
+    return [
+        dict(zip(columns, row))
+        for row in cursor.fetchall()
+    ]
+
+
+
+def get_findings_summary(recent_limit=10):
+    """Return deterministic finding analytics and recent findings."""
+
+    recent_limit = _bounded_read_limit(
+        recent_limit,
+        default=10,
+        maximum=50,
+    )
+
+    with _connection() as conn:
+        status_rows = conn.execute("""
+            SELECT status, COUNT(*) AS count
+            FROM findings
+            GROUP BY status
+            ORDER BY status
+        """).fetchall()
+
+        severity_rows = conn.execute("""
+            SELECT severity, COUNT(*) AS count
+            FROM findings
+            GROUP BY severity
+            ORDER BY severity
+        """).fetchall()
+
+        cross_tab_rows = conn.execute("""
+            SELECT severity, status, COUNT(*) AS count
+            FROM findings
+            GROUP BY severity, status
+            ORDER BY severity, status
+        """).fetchall()
+
+        rule_cursor = conn.execute("""
+            SELECT
+                rule_id,
+                COUNT(*) AS count,
+                SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END)
+                    AS active,
+                SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END)
+                    AS resolved
+            FROM findings
+            GROUP BY rule_id
+            ORDER BY count DESC, rule_id
+        """)
+
+        host_cursor = conn.execute("""
+            SELECT
+                host,
+                COUNT(*) AS count,
+                SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END)
+                    AS active,
+                SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END)
+                    AS resolved
+            FROM findings
+            GROUP BY host
+            ORDER BY count DESC, host
+        """)
+        lifecycle_row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(
+                    SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END),
+                    0
+                ) AS active,
+                COALESCE(
+                    SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END),
+                    0
+                ) AS resolved,
+                COALESCE(
+                    SUM(CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END),
+                    0
+                ) AS with_resolved_at,
+                AVG(
+                    CASE
+                        WHEN resolved_at IS NOT NULL
+                        THEN (
+                            julianday(resolved_at) - julianday(first_seen)
+                        ) * 86400.0
+                    END
+                ) AS average_resolution_seconds,
+                MIN(first_seen) AS oldest_first_seen,
+                MAX(last_seen) AS newest_last_seen
+            FROM findings
+        """).fetchone()
+
+        total = conn.execute("""
+            SELECT COUNT(*) FROM findings
+        """).fetchone()[0]
+
+        recent_cursor = conn.execute("""
+            SELECT id, rule_id, severity, host, evidence,
+                   first_seen, last_seen, status, resolved_at
+            FROM findings
+            ORDER BY last_seen DESC, id DESC
+            LIMIT ?
+        """, (recent_limit,))
+
+        by_severity_and_status = {}
+
+        for severity, status, count in cross_tab_rows:
+            by_severity_and_status.setdefault(severity, {})[status] = count
+
+        lifecycle = dict(zip(
+            (
+                "total",
+                "active",
+                "resolved",
+                "with_resolved_at",
+                "average_resolution_seconds",
+                "oldest_first_seen",
+                "newest_last_seen",
+            ),
+            lifecycle_row,
+        ))
+
+        if lifecycle["average_resolution_seconds"] is not None:
+            lifecycle["average_resolution_seconds"] = round(
+                lifecycle["average_resolution_seconds"],
+                2,
+            )
+
+        return {
+            "total_findings": total,
+            "by_status": {
+                status: count for status, count in status_rows
+            },
+            "by_severity": {
+                severity: count for severity, count in severity_rows
+            },
+            "by_severity_and_status": by_severity_and_status,
+            "by_rule": _rows_as_dicts(rule_cursor),
+            "by_host": _rows_as_dicts(host_cursor),
+            "lifecycle": lifecycle,
+            "recent_findings": _rows_as_dicts(recent_cursor),
+        }
+
+
+
+def get_finding_details(finding_id: int):
+    """Return a finding and its recorded scan-by-scan history."""
+
+    try:
+        finding_id = int(finding_id)
+    except (TypeError, ValueError):
+        raise ValueError("finding_id must be an integer.")
+
+    with _connection() as conn:
+        finding_cursor = conn.execute("""
+            SELECT
+                id, rule_id, severity, host, evidence,
+                first_seen, last_seen, status,
+                last_seen_run_id, resolved_at, finding_key
+            FROM findings
+            WHERE id = ?
+        """, (finding_id,))
+
+        finding_rows = _rows_as_dicts(finding_cursor)
+
+        if not finding_rows:
+            return {
+                "finding": None,
+                "history": [],
+            }
+
+        history_cursor = conn.execute("""
+            SELECT
+                s.run_id,
+                r.started_at,
+                r.completed_at,
+                s.severity,
+                s.evidence,
+                s.status,
+                s.resolved_at
+            FROM scan_run_findings AS s
+            JOIN scan_runs AS r ON r.id = s.run_id
+            WHERE s.finding_id = ?
+            ORDER BY s.run_id
+        """, (finding_id,))
+
+        return {
+            "finding": finding_rows[0],
+            "history": _rows_as_dicts(history_cursor),
+        }
+
+
+def compare_scan_runs(
+    older_run_id: int,
+    newer_run_id: int,
+    limit: int = 50,
+):
+    """Compare two completed scan snapshots using stable finding IDs."""
+
+    try:
+        older_run_id = int(older_run_id)
+        newer_run_id = int(newer_run_id)
+    except (TypeError, ValueError):
+        raise ValueError("Scan run IDs must be integers.")
+
+    if older_run_id == newer_run_id:
+        raise ValueError("The two scan run IDs must be different.")
+
+    limit = _bounded_read_limit(limit, default=50, maximum=100)
+
+    categories = (
+        "added",
+        "resolved",
+        "reactivated",
+        "changed",
+        "unchanged",
+        "removed",
+    )
+
+    with _connection() as conn:
+        run_cursor = conn.execute("""
+            SELECT
+                id, started_at, completed_at,
+                status, snapshot_recorded
+            FROM scan_runs
+            WHERE id IN (?, ?)
+            ORDER BY id
+        """, (older_run_id, newer_run_id))
+
+        runs = {
+            row["id"]: row
+            for row in _rows_as_dicts(run_cursor)
+        }
+
+        for run_id in (older_run_id, newer_run_id):
+            if run_id not in runs:
+                raise ValueError(f"Scan run {run_id} does not exist.")
+
+            if runs[run_id]["status"] != "COMPLETED":
+                raise ValueError(
+                    f"Scan run {run_id} is not completed."
+                )
+
+            if not runs[run_id]["snapshot_recorded"]:
+                return {
+                    "available": False,
+                    "reason": (
+                        f"Scan run {run_id} has no recorded finding "
+                        "snapshot. It may predate snapshot support."
+                    ),
+                    "older_run": runs[older_run_id],
+                    "newer_run": runs[newer_run_id],
+                }
+
+        def load_snapshot(run_id):
+            cursor = conn.execute("""
+                SELECT
+                    finding_id, rule_id, severity, host,
+                    evidence, first_seen, last_seen,
+                    status, resolved_at, finding_key
+                FROM scan_run_findings
+                WHERE run_id = ?
+                ORDER BY finding_id
+            """, (run_id,))
+
+            return {
+                row["finding_id"]: row
+                for row in _rows_as_dicts(cursor)
+            }
+
+        older = load_snapshot(older_run_id)
+        newer = load_snapshot(newer_run_id)
+
+    changes = {category: [] for category in categories}
+    counts = {category: 0 for category in categories}
+
+    all_ids = sorted(set(older) | set(newer))
+
+    for finding_id in all_ids:
+        old = older.get(finding_id)
+        new = newer.get(finding_id)
+
+        category = None
+
+        if old is None:
+            category = "added"
+        elif new is None:
+            category = "removed"
+        elif old["status"] == "ACTIVE" and new["status"] == "RESOLVED":
+            category = "resolved"
+        elif old["status"] == "RESOLVED" and new["status"] == "ACTIVE":
+            category = "reactivated"
+        else:
+            changed_fields = [
+                field
+                for field in (
+                    "rule_id",
+                    "severity",
+                    "host",
+                    "evidence",
+                    "finding_key",
+                )
+                if old[field] != new[field]
+            ]
+
+            if changed_fields:
+                category = "changed"
+            else:
+                category = "unchanged"
+
+        counts[category] += 1
+
+        if len(changes[category]) < limit:
+            changes[category].append({
+                "finding_id": finding_id,
+                "old": old,
+                "new": new,
+            })
+
+    return {
+        "available": True,
+        "older_run": runs[older_run_id],
+        "newer_run": runs[newer_run_id],
+        "counts": counts,
+        "returned": {
+            category: len(records)
+            for category, records in changes.items()
+        },
+        "limit_per_category": limit,
+        "changes": changes,
+    }
+
+
+
+def query_findings(
+    status=None,
+    severity=None,
+    host=None,
+    rule_id=None,
+    limit=50,
+    offset=0,
+):
+    """Return filtered findings with a hard result limit."""
+    limit = _bounded_read_limit(limit)
+
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+
+    filters = []
+    parameters = []
+
+    for column, value in (
+        ("status", status),
+        ("severity", severity),
+        ("host", host),
+        ("rule_id", rule_id),
+    ):
+        if value is not None and str(value).strip():
+            filters.append(f"{column} = ?")
+            parameters.append(str(value).strip().upper()
+                              if column in {"status", "severity"}
+                              else str(value).strip())
+
+    where_clause = (
+        " WHERE " + " AND ".join(filters)
+        if filters else ""
+    )
+
+    with _connection() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM findings{where_clause}",
+            parameters,
+        ).fetchone()[0]
+
+        cursor = conn.execute(
+            f"""
+            SELECT id, rule_id, severity, host, evidence,
+                   first_seen, last_seen, status, resolved_at,
+                   last_seen_run_id
+            FROM findings
+            {where_clause}
+            ORDER BY last_seen DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*parameters, limit, offset),
+        )
+
+        findings = _rows_as_dicts(cursor)
+
+    return {
+        "total": total,
+        "returned": len(findings),
+        "limit": limit,
+        "offset": offset,
+        "findings": findings,
+    }
+
+
+def query_host_inventory(limit=200):
+    """Return a bounded host inventory."""
+    limit = _bounded_read_limit(limit)
+
+    with _connection() as conn:
+        cursor = conn.execute("""
+            SELECT ip, status, hostname, last_seen
+            FROM hosts
+            ORDER BY ip
+            LIMIT ?
+        """, (limit,))
+
+        hosts = _rows_as_dicts(cursor)
+
+    return {
+        "returned": len(hosts),
+        "limit": limit,
+        "hosts": hosts,
+    }
+
+
+def query_service_inventory(host_ip=None, limit=200):
+    """Return a bounded service inventory, optionally filtered by host."""
+    limit = _bounded_read_limit(limit)
+
+    with _connection() as conn:
+        if host_ip and host_ip.strip():
+            cursor = conn.execute("""
+                SELECT host_ip, port, protocol, service,
+                       product, version, last_seen
+                FROM services
+                WHERE host_ip = ?
+                ORDER BY port, protocol
+                LIMIT ?
+            """, (host_ip.strip(), limit))
+        else:
+            cursor = conn.execute("""
+                SELECT host_ip, port, protocol, service,
+                       product, version, last_seen
+                FROM services
+                ORDER BY host_ip, port, protocol
+                LIMIT ?
+            """, (limit,))
+
+        services = _rows_as_dicts(cursor)
+
+    return {
+        "returned": len(services),
+        "limit": limit,
+        "services": services,
+    }
+
+
+def query_scan_history(limit=20):
+    """Return recent scan runs."""
+    limit = _bounded_read_limit(
+        limit,
+        default=20,
+        maximum=100,
+    )
+
+    with _connection() as conn:
+        cursor = conn.execute("""
+            SELECT id, started_at, completed_at, status, error
+            FROM scan_runs
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+
+        runs = _rows_as_dicts(cursor)
+
+    return {
+        "returned": len(runs),
+        "limit": limit,
+        "scan_runs": runs,
+    }
